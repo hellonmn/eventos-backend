@@ -1,3 +1,4 @@
+// seed file for subscription
 require('dotenv').config();
 const mongoose = require('mongoose');
 const { SubscriptionPlan } = require('./src/models/Subscription');
