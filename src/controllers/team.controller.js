@@ -1,6 +1,7 @@
 const Team = require('../models/Team');
 const Hackathon = require('../models/Hackathon');
 const User = require('../models/User');
+const JoinRequest = require('../models/JoinRequest');
 const emailService = require('../services/email.service');
 
 // @desc    Register team for hackathon
@@ -126,16 +127,559 @@ exports.registerTeam = async (req, res) => {
     await team.populate('leader', 'fullName email username');
 
     // Send confirmation email
-    await emailService.sendTeamRegistrationConfirmation(
-      { teamName, members: teamMembers, leader: req.user },
-      hackathon
-    );
+    try {
+      await emailService.sendTeamRegistrationConfirmation(
+        { teamName, members: teamMembers, leader: req.user },
+        hackathon
+      );
+    } catch (emailError) {
+      console.error('Failed to send confirmation email:', emailError);
+      // Don't fail the registration if email fails
+    }
 
     res.status(201).json({
       success: true,
       message: 'Team registered successfully',
       team,
       requiresPayment: hackathon.registrationFee.amount > 0
+    });
+  } catch (error) {
+    console.error('Registration error:', error);
+    res.status(500).json({
+      success: false,
+      message: error.message
+    });
+  }
+};
+
+// @desc    Get user's team for a specific hackathon
+// @route   GET /api/teams/my/hackathon/:hackathonId
+// @access  Private
+exports.getUserTeamForHackathon = async (req, res) => {
+  try {
+    const { hackathonId } = req.params;
+
+    const team = await Team.findOne({
+      hackathon: hackathonId,
+      $or: [
+        { leader: req.user._id },
+        { 'members.user': req.user._id, 'members.status': 'active' }
+      ]
+    })
+      .populate('leader', 'fullName email username')
+      .populate('members.user', 'fullName email username')
+      .populate('hackathon', 'title');
+
+    if (!team) {
+      return res.status(404).json({
+        success: false,
+        message: 'Not registered for this hackathon'
+      });
+    }
+
+    res.status(200).json({
+      success: true,
+      team
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: error.message
+    });
+  }
+};
+
+// @desc    Search users for team invitation
+// @route   GET /api/teams/hackathon/:hackathonId/search-users
+// @access  Private
+exports.searchUsersForTeam = async (req, res) => {
+  try {
+    const { hackathonId } = req.params;
+    const { query } = req.query;
+
+    if (!query || query.length < 2) {
+      return res.status(400).json({
+        success: false,
+        message: 'Query must be at least 2 characters'
+      });
+    }
+
+    // Find all users matching the search (not limited to hackathon participants)
+    // Filter to include users with student role or no roles (defaults to student)
+    const users = await User.find({
+      $and: [
+        {
+          $or: [
+            { fullName: { $regex: query, $options: 'i' } },
+            { username: { $regex: query, $options: 'i' } },
+            { email: { $regex: query, $options: 'i' } }
+          ]
+        },
+        {
+          _id: { $ne: req.user._id } // Exclude current user
+        },
+        {
+          $or: [
+            { roles: { $in: ['student'] } },
+            { roles: { $size: 0 } },
+            { roles: { $exists: false } }
+          ]
+        }
+      ]
+    })
+      .select('fullName username email roles institution')
+      .limit(50); // Increased limit to search more users
+
+    console.log(`Found ${users.length} users matching search query: ${query}`);
+
+    // Get all user IDs that are already in teams for this hackathon (for efficient filtering)
+    const teamsInHackathon = await Team.find({
+      hackathon: hackathonId,
+      'members.status': 'active'
+    }).select('members.user');
+
+    const userIdsInTeams = new Set();
+    teamsInHackathon.forEach(team => {
+      team.members.forEach(member => {
+        if (member.user) {
+          userIdsInTeams.add(member.user.toString());
+        }
+      });
+    });
+
+    // Get all pending join requests for this team to show invite status
+    const teamId = req.query.teamId; // Get teamId from query params
+    const pendingRequests = teamId ? await JoinRequest.find({
+      team: teamId,
+      hackathon: hackathonId,
+      status: 'pending'
+    }).select('user') : [];
+
+    const userIdsWithPendingRequests = new Set();
+    pendingRequests.forEach(request => {
+      if (request.user) {
+        userIdsWithPendingRequests.add(request.user.toString());
+      }
+    });
+
+    // Filter out users already in teams for this hackathon and add request status
+    const usersNotInTeams = users
+      .filter(user => !userIdsInTeams.has(user._id.toString()))
+      .map(user => {
+        const userObj = user.toObject();
+        userObj.hasPendingRequest = userIdsWithPendingRequests.has(user._id.toString());
+        // Ensure roles is always an array (default to student if empty)
+        if (!userObj.roles || userObj.roles.length === 0) {
+          userObj.roles = ['student'];
+        }
+        return userObj;
+      });
+
+    console.log(`Returning ${usersNotInTeams.length} users not in teams (after filtering)`);
+
+    res.status(200).json({
+      success: true,
+      users: usersNotInTeams
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: error.message
+    });
+  }
+};
+
+// @desc    Send join request to user
+// @route   POST /api/teams/:teamId/join-requests
+// @access  Private (Team Leader)
+exports.sendJoinRequest = async (req, res) => {
+  try {
+    const { teamId } = req.params;
+    const { userId } = req.body;
+
+    const team = await Team.findById(teamId).populate('hackathon');
+    if (!team) {
+      return res.status(404).json({
+        success: false,
+        message: 'Team not found'
+      });
+    }
+
+    // Check if user is team leader
+    if (team.leader.toString() !== req.user._id.toString()) {
+      return res.status(403).json({
+        success: false,
+        message: 'Only team leader can send join requests'
+      });
+    }
+
+    // Check if team is full
+    if (team.members.length >= team.hackathon.teamConfig.maxMembers) {
+      return res.status(400).json({
+        success: false,
+        message: 'Team is already full'
+      });
+    }
+
+    // Check if user exists
+    const user = await User.findById(userId);
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: 'User not found'
+      });
+    }
+
+    // Check if user is already in a team for this hackathon
+    const userTeam = await Team.findOne({
+      hackathon: team.hackathon._id,
+      'members.user': userId,
+      'members.status': 'active'
+    });
+
+    if (userTeam) {
+      return res.status(400).json({
+        success: false,
+        message: 'User is already in a team for this hackathon'
+      });
+    }
+
+    // Check if request already exists
+    const existingRequest = await JoinRequest.findOne({
+      team: teamId,
+      user: userId,
+      status: 'pending'
+    });
+
+    if (existingRequest) {
+      return res.status(400).json({
+        success: false,
+        message: 'Join request already sent to this user'
+      });
+    }
+
+    // Create join request
+    const joinRequest = await JoinRequest.create({
+      team: teamId,
+      user: userId,
+      sender: req.user._id,
+      hackathon: team.hackathon._id,
+      message: `${req.user.fullName} has invited you to join their team "${team.teamName}"`
+    });
+
+    // Send notification email
+    try {
+      await emailService.sendJoinRequestNotification(user, team, req.user);
+    } catch (emailError) {
+      console.error('Failed to send notification email:', emailError);
+    }
+
+    res.status(201).json({
+      success: true,
+      message: 'Join request sent successfully',
+      joinRequest
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: error.message
+    });
+  }
+};
+
+// @desc    Get join requests for a team
+// @route   GET /api/teams/:teamId/join-requests
+// @access  Private (Team Leader)
+exports.getJoinRequests = async (req, res) => {
+  try {
+    const { teamId } = req.params;
+
+    const team = await Team.findById(teamId);
+    if (!team) {
+      return res.status(404).json({
+        success: false,
+        message: 'Team not found'
+      });
+    }
+
+    // Check if user is team leader
+    if (team.leader.toString() !== req.user._id.toString()) {
+      return res.status(403).json({
+        success: false,
+        message: 'Only team leader can view join requests'
+      });
+    }
+
+    const joinRequests = await JoinRequest.find({
+      team: teamId,
+      status: 'pending'
+    })
+      .populate('user', 'fullName email username')
+      .populate('sender', 'fullName')
+      .sort({ createdAt: -1 });
+
+    res.status(200).json({
+      success: true,
+      joinRequests
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: error.message
+    });
+  }
+};
+
+// @desc    Get my join requests (as a user)
+// @route   GET /api/teams/my/join-requests
+// @access  Private
+exports.getMyJoinRequests = async (req, res) => {
+  try {
+    const joinRequests = await JoinRequest.find({
+      user: req.user._id,
+      status: 'pending'
+    })
+      .populate('team', 'teamName')
+      .populate('sender', 'fullName')
+      .populate('hackathon', 'title')
+      .sort({ createdAt: -1 });
+
+    res.status(200).json({
+      success: true,
+      joinRequests
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: error.message
+    });
+  }
+};
+
+// @desc    Accept join request
+// @route   POST /api/teams/:teamId/join-requests/:requestId/accept
+// @access  Private (User receiving request)
+exports.acceptJoinRequest = async (req, res) => {
+  try {
+    const { teamId, requestId } = req.params;
+
+    const joinRequest = await JoinRequest.findOne({
+      _id: requestId,
+      team: teamId,
+      user: req.user._id,
+      status: 'pending'
+    }).populate('team').populate('hackathon');
+
+    if (!joinRequest) {
+      return res.status(404).json({
+        success: false,
+        message: 'Join request not found'
+      });
+    }
+
+    // Check if user is already in a team for this hackathon
+    const existingTeam = await Team.findOne({
+      hackathon: joinRequest.hackathon._id,
+      'members.user': req.user._id,
+      'members.status': 'active'
+    });
+
+    if (existingTeam) {
+      return res.status(400).json({
+        success: false,
+        message: 'You are already in a team for this hackathon'
+      });
+    }
+
+    const team = await Team.findById(teamId).populate('hackathon');
+
+    // Check if team is full
+    if (team.members.length >= team.hackathon.teamConfig.maxMembers) {
+      return res.status(400).json({
+        success: false,
+        message: 'Team is already full'
+      });
+    }
+
+    // Add user to team
+    team.members.push({
+      user: req.user._id,
+      role: 'member',
+      status: 'active',
+      joinedAt: new Date()
+    });
+
+    await team.save();
+
+    // Update join request status
+    joinRequest.status = 'accepted';
+    joinRequest.respondedAt = new Date();
+    await joinRequest.save();
+
+    // Reject all other pending requests for this user for the same hackathon
+    await JoinRequest.updateMany(
+      {
+        user: req.user._id,
+        hackathon: joinRequest.hackathon._id,
+        status: 'pending',
+        _id: { $ne: requestId }
+      },
+      {
+        status: 'rejected',
+        respondedAt: new Date()
+      }
+    );
+
+    res.status(200).json({
+      success: true,
+      message: 'Successfully joined the team',
+      team
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: error.message
+    });
+  }
+};
+
+// @desc    Reject join request
+// @route   POST /api/teams/:teamId/join-requests/:requestId/reject
+// @access  Private (User receiving request)
+exports.rejectJoinRequest = async (req, res) => {
+  try {
+    const { teamId, requestId } = req.params;
+
+    const joinRequest = await JoinRequest.findOne({
+      _id: requestId,
+      team: teamId,
+      user: req.user._id,
+      status: 'pending'
+    });
+
+    if (!joinRequest) {
+      return res.status(404).json({
+        success: false,
+        message: 'Join request not found'
+      });
+    }
+
+    joinRequest.status = 'rejected';
+    joinRequest.respondedAt = new Date();
+    await joinRequest.save();
+
+    res.status(200).json({
+      success: true,
+      message: 'Join request rejected'
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: error.message
+    });
+  }
+};
+
+// @desc    Approve team (Admin)
+// @route   PUT /api/teams/:id/approve
+// @access  Private (Admin, Organizer)
+exports.approveTeam = async (req, res) => {
+  try {
+    const team = await Team.findById(req.params.id).populate('hackathon');
+
+    if (!team) {
+      return res.status(404).json({
+        success: false,
+        message: 'Team not found'
+      });
+    }
+
+    // Check authorization
+    const isOrganizer = team.hackathon.organizer.toString() === req.user._id.toString();
+    const isAdmin = req.user.hasAnyRole(['admin', 'super_admin']);
+
+    if (!isOrganizer && !isAdmin) {
+      return res.status(403).json({
+        success: false,
+        message: 'Not authorized to approve teams'
+      });
+    }
+
+    team.registrationStatus = 'approved';
+    team.approvedAt = new Date();
+    team.approvedBy = req.user._id;
+    await team.save();
+
+    // Send notification email
+    try {
+      const leader = await User.findById(team.leader);
+      await emailService.sendTeamApprovalNotification(leader, team, team.hackathon);
+    } catch (emailError) {
+      console.error('Failed to send approval email:', emailError);
+    }
+
+    res.status(200).json({
+      success: true,
+      message: 'Team approved successfully',
+      team
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: error.message
+    });
+  }
+};
+
+// @desc    Reject team (Admin)
+// @route   PUT /api/teams/:id/reject
+// @access  Private (Admin, Organizer)
+exports.rejectTeam = async (req, res) => {
+  try {
+    const { reason } = req.body;
+    const team = await Team.findById(req.params.id).populate('hackathon');
+
+    if (!team) {
+      return res.status(404).json({
+        success: false,
+        message: 'Team not found'
+      });
+    }
+
+    // Check authorization
+    const isOrganizer = team.hackathon.organizer.toString() === req.user._id.toString();
+    const isAdmin = req.user.hasAnyRole(['admin', 'super_admin']);
+
+    if (!isOrganizer && !isAdmin) {
+      return res.status(403).json({
+        success: false,
+        message: 'Not authorized to reject teams'
+      });
+    }
+
+    team.registrationStatus = 'rejected';
+    if (reason) {
+      team.notes.push({
+        author: req.user._id,
+        content: `Rejection reason: ${reason}`,
+        createdAt: new Date(),
+        isPublic: true
+      });
+    }
+    await team.save();
+
+    // Send notification email
+    try {
+      const leader = await User.findById(team.leader);
+      await emailService.sendTeamRejectionNotification(leader, team, team.hackathon, reason);
+    } catch (emailError) {
+      console.error('Failed to send rejection email:', emailError);
+    }
+
+    res.status(200).json({
+      success: true,
+      message: 'Team rejected',
+      team
     });
   } catch (error) {
     res.status(500).json({
@@ -160,6 +704,7 @@ exports.getTeamsByHackathon = async (req, res) => {
     const teams = await Team.find(query)
       .populate('leader', 'fullName email username institution')
       .populate('members.user', 'fullName email username institution')
+      .populate('hackathon', 'title')
       .sort({ overallScore: -1, createdAt: -1 })
       .limit(limit * 1)
       .skip((page - 1) * limit);
@@ -611,6 +1156,221 @@ exports.getMyTeams = async (req, res) => {
       success: true,
       count: teams.length,
       teams
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: error.message
+    });
+  }
+};
+
+// @desc    Leave team
+// @route   POST /api/teams/:teamId/leave
+// @access  Private
+exports.leaveTeam = async (req, res) => {
+  try {
+    const { teamId } = req.params;
+    const team = await Team.findById(teamId);
+
+    if (!team) {
+      return res.status(404).json({
+        success: false,
+        message: 'Team not found'
+      });
+    }
+
+    // Check if user is the leader
+    if (team.leader.toString() === req.user._id.toString()) {
+      return res.status(400).json({
+        success: false,
+        message: 'Team leader cannot leave the team. Please transfer leadership first.'
+      });
+    }
+
+    // Find the member
+    const memberIndex = team.members.findIndex(
+      m => m.user.toString() === req.user._id.toString() && m.status === 'active'
+    );
+
+    if (memberIndex === -1) {
+      return res.status(404).json({
+        success: false,
+        message: 'You are not a member of this team'
+      });
+    }
+
+    // Mark member as left
+    team.members[memberIndex].status = 'left';
+
+    await team.save();
+
+    res.status(200).json({
+      success: true,
+      message: 'Successfully left the team',
+      team
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: error.message
+    });
+  }
+};
+
+// @desc    Remove member from team
+// @route   DELETE /api/teams/:teamId/members/:memberId
+// @access  Private (Team Leader)
+exports.removeMember = async (req, res) => {
+  try {
+    const { teamId, memberId } = req.params;
+    const team = await Team.findById(teamId);
+
+    if (!team) {
+      return res.status(404).json({
+        success: false,
+        message: 'Team not found'
+      });
+    }
+
+    // Check if user is team leader
+    if (team.leader.toString() !== req.user._id.toString()) {
+      return res.status(403).json({
+        success: false,
+        message: 'Only team leader can remove members'
+      });
+    }
+
+    // Find the member
+    const memberIndex = team.members.findIndex(
+      m => m._id.toString() === memberId && m.status === 'active'
+    );
+
+    if (memberIndex === -1) {
+      return res.status(404).json({
+        success: false,
+        message: 'Member not found in team'
+      });
+    }
+
+    // Check if trying to remove leader
+    if (team.members[memberIndex].role === 'leader') {
+      return res.status(400).json({
+        success: false,
+        message: 'Cannot remove team leader'
+      });
+    }
+
+    // Mark member as removed
+    team.members[memberIndex].status = 'removed';
+
+    await team.save();
+
+    res.status(200).json({
+      success: true,
+      message: 'Member removed successfully',
+      team
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: error.message
+    });
+  }
+};
+
+// @desc    Get pending members (users with pending join requests)
+// @route   GET /api/teams/:teamId/pending-members
+// @access  Private (Team Leader)
+exports.getPendingMembers = async (req, res) => {
+  try {
+    const { teamId } = req.params;
+    const team = await Team.findById(teamId);
+
+    if (!team) {
+      return res.status(404).json({
+        success: false,
+        message: 'Team not found'
+      });
+    }
+
+    // Check if user is team leader
+    if (team.leader.toString() !== req.user._id.toString()) {
+      return res.status(403).json({
+        success: false,
+        message: 'Only team leader can view pending members'
+      });
+    }
+
+    const pendingRequests = await JoinRequest.find({
+      team: teamId,
+      status: 'pending'
+    })
+      .populate('user', 'fullName username email roles institution')
+      .populate('sender', 'fullName')
+      .sort({ createdAt: -1 });
+
+    res.status(200).json({
+      success: true,
+      pendingMembers: pendingRequests
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: error.message
+    });
+  }
+};
+
+// @desc    Cancel join request
+// @route   DELETE /api/teams/:teamId/join-requests/:requestId
+// @access  Private (Team Leader or Request Sender)
+exports.cancelJoinRequest = async (req, res) => {
+  try {
+    const { teamId, requestId } = req.params;
+    const team = await Team.findById(teamId);
+
+    if (!team) {
+      return res.status(404).json({
+        success: false,
+        message: 'Team not found'
+      });
+    }
+
+    const joinRequest = await JoinRequest.findById(requestId);
+
+    if (!joinRequest) {
+      return res.status(404).json({
+        success: false,
+        message: 'Join request not found'
+      });
+    }
+
+    // Check if user is team leader or the sender
+    const isTeamLeader = team.leader.toString() === req.user._id.toString();
+    const isSender = joinRequest.sender.toString() === req.user._id.toString();
+
+    if (!isTeamLeader && !isSender) {
+      return res.status(403).json({
+        success: false,
+        message: 'Not authorized to cancel this request'
+      });
+    }
+
+    if (joinRequest.status !== 'pending') {
+      return res.status(400).json({
+        success: false,
+        message: 'Can only cancel pending requests'
+      });
+    }
+
+    joinRequest.status = 'cancelled';
+    joinRequest.respondedAt = new Date();
+    await joinRequest.save();
+
+    res.status(200).json({
+      success: true,
+      message: 'Join request cancelled successfully'
     });
   } catch (error) {
     res.status(500).json({
